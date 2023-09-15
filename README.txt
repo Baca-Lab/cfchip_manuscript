@@ -13,5 +13,3 @@ data/peaks/Ac_mPC15_all.rep1_sorted_peaks.narrowPeak.bed
 data/peaks/Ac_mPC16_1R.rep1_sorted_peaks.narrowPeak.bed
 data/peaks/Ac_mPC17_3R.rep1_sorted_peaks.narrowPeak.bed
 
-Currently (5/23/23), these directories are on erisone here:
-/data/baca/users/sb429/projects/cfChIP_manuscript/manuscript_pipeline/github/data
