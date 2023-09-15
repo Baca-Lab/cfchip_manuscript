@@ -1,0 +1,1697 @@
+---
+title: "cfChIP manuscript analyses"
+author: "Sylvan Baca"
+date: "2023-04-04"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This document contains the analyses for the cfChIP-seq manuscript. To run it, install the required libraries and change the root dir below as needed
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      root.dir = '/Users/sylvan/Desktop/cfChIP_github/cfChIP_manuscript')
+library(rtracklayer)
+library(GenomicRanges)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(data.table)
+library(readxl)
+library(GGally)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(ROCR)
+
+source('scripts/CREs.R')
+source('scripts/common_functions.R')
+```
+
+Create an oncoprint-style plot of the cohort (based on code from Xintao Qiu)
+``` {r cohort_plot}
+
+set.seed(1)
+
+library(tidyverse)
+library(ComplexHeatmap)
+
+metadata_file = 'data/metadata/Initial_manuscript_samples.xlsx'
+meta = read_xlsx(metadata_file, na = 'NA')
+meta = meta  %>% 
+  dplyr::select('study_name', 'antibody', 'cancer_type', 'individual_id') 
+
+# adjust metasheet labels as needed
+meta$cancer_type[meta$cancer_type == 'PRAD'] = 'Prostate'
+meta$cancer_type[meta$cancer_type == 'post_BMT'] = 'Post-BMT'
+meta$cancer_type[meta$cancer_type == 'EGFRm Post-tSCLC'] = 'SCLC'
+
+ann = as.data.frame(meta)
+rownames(ann) = ann$study_name
+
+pdata = xtabs(~antibody + individual_id, meta) %>% as.matrix()
+pdata = ifelse(pdata > 0, "yes", "")
+
+tmp = xtabs(~antibody, ann) # number of samples for each antibody
+rownames(pdata) = paste0(names(tmp), ' (N=', tmp, ')')
+  
+heatmap_legend_param = list(title = "Oncoprint", at = c("yes"), 
+                            labels = c("yes"))
+
+col = c("yes" = "#7FB5FF")
+alter_fun = list(
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = "grey90", col = NA))
+  },
+  yes = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(0, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["yes"], col = NA))
+  }
+)
+
+p = oncoPrint(pdata,
+                show_column_names = FALSE, 
+                show_pct = FALSE,
+                row_order = rownames(pdata)[c(2,1,5,4,3)],
+                column_order = NULL, 
+                alter_fun = alter_fun, col = col, 
+                remove_empty_columns = TRUE, remove_empty_rows = FALSE,
+                show_heatmap_legend = FALSE,
+                top_annotation = HeatmapAnnotation(cbar = anno_oncoprint_barplot(),
+                                                   Type = factor(ann$cancer_type),
+                                                   show_legend = TRUE
+                ),
+                column_title = "cell-free epigenomic datasets", heatmap_legend_param = heatmap_legend_param)
+
+print(p)
+
+
+```
+
+
+Get common DHS sites if needed. The DHS data come from here: https://zenodo.org/record/3838751/files/DHS_Index_and_Vocabulary_hg19_WM20190703.txt.gz?download=1
+The idea is to find sites that tend to be active regulatory elements in all/most tissues. These will be used to normalize the cfChIP signal for various analyses to account for variation in ChIP enrichment and other technical factors. 
+
+``` {r common_DHS_sites}
+if(FALSE) {
+dhs = read.table('data/sites/DHS/DHS_Index_and_Vocabulary_hg19_WM20190703.txt', header = T, sep = '\t')
+dhs[order(dhs$numsamples, decreasing = TRUE), c('seqname', 'start', 'end')] %>% head(10000) %>% export(con = 'data/sites/top_common_DHS.bed')
+rm(dhs)
+}
+```
+
+# CRE analysis
+This analysis searches for ctDNA-correlated regulatory elements. These are regions of the genome where cfChIP-seq signal is correlated (or anticorrelated) with ctDNA content. Correlated regions are expected to represent sites that are marked in cancer more so than in healthy. Inversely correlated regions may correspond to sites that are marked in healthy-derived nucleosomes but NOT cancer.
+
+```{r CREs, message=TRUE}
+# file with noisy regions to exclude
+exclude_regions_file = 'data/sites/hg19-blacklist.v2.bed'
+
+# read metadata
+metadata_file = 'data/metadata/Initial_manuscript_samples.xlsx'
+meta = read_xlsx(metadata_file, na = 'NA')
+meta$ctDNA = as.numeric(meta$ctDNA)
+meta$peak_number = as.numeric(meta$peak_number)
+
+#remove H3K4me3 Diagenode antibody data - this is the minority (most H3K4me3 profiles were generated with the Thermo Fisher antibody)
+meta = subset(meta, !(antibody == 'H3K4me3' & antibody_vendor == 'Diagenode'))  
+
+# --- iterate through different marks, calculating CREs for each
+for(mark in setdiff(unique(meta$antibody), 'LPWGS')) { 
+
+  # CREs are calculated for all samples and separately for each cancer type where there are enough examples
+  for(this_type_only in c('all', unique(meta$cancer_type))) {
+    meta_subset = subset(meta, antibody == mark & !is.na(rds_file))
+    
+    if(this_type_only != 'all') {
+      meta_subset = subset(meta_subset, cancer_type == this_type_only)
+    }
+    
+    # if there are too few examples with reasonable ctDNA and high quality for this cancer type / mark combo, skip it:
+    if(sum(meta_subset$ctDNA > 0.03 & 
+        (meta_subset$antibody == 'MeDIP' | 
+         meta_subset$enrichment * meta_subset$fragments > 4e7 & 
+         meta_subset$enrichment > 10),
+           na.rm = TRUE) < 5) next
+    
+    message('finding CREs for ', mark, ' for cancer type ', this_type_only)
+    
+    # for defining peaks, keep only samples with peaks in a certain range, unless MeDIP
+    peak_max = 30000
+    peak_min = 5000
+    keep = !is.na(meta_subset$peak_file) 
+    
+    if(mark != 'MeDIP') {
+      keep = meta_subset$peak_number <= peak_max &
+        meta_subset$peak_number > peak_min
+        keep = !is.na(keep) 
+    }
+    
+    # load all peaks and merge them 
+    peak_files = meta_subset$peak_file %>% str_replace('.*/', 'data/peaks/')  
+    peak_files = peak_files[keep]
+    peaks = lapply(peak_files, import)
+    targets = do.call(c, peaks) %>% GenomicRanges::reduce(min.gapwidth = 0)
+
+    # remove noisy regions that should be excluded
+    exclude_regions = import(exclude_regions_file, format = 'bed')
+    targets = targets[!(targets %over% exclude_regions) &
+                        !(seqnames(targets) %in% c('chrX', 'chrY', 'chrM'))]
+    
+    # export a bed file with target regions
+    dir.create('out/union_peaks/', recursive = TRUE)
+    export(
+      targets,
+      con = paste0('out/union_peaks/', mark, '_', this_type_only, '_union_peaks.bed'),
+      format = 'bed'
+    )
+    
+    frag_files = meta_subset$rds_file
+    
+    # load file for normalization - this uses the top 10,000 DHS sites by recurrence across samples from Boix et al Nature
+    top_common_DHS = import('data/sites/top_common_DHS.bed') %>% resize(width = 2000, fix = 'center')
+
+    if (TRUE) {  # recalculate counts at peaks
+      counts_norm = frag_counts(frag_files, 
+                                sample_names = meta_subset$study_name[meta_subset$rds_file %in% frag_files], 
+                                targets = targets, 
+                                normalize = top_common_DHS) 
+      dir.create('out/frag_counts/', recursive = TRUE)
+      saveRDS(counts_norm, paste0('out/frag_counts/', mark, '_', this_type_only, '_frag_counts.RDS'))
+    } else {
+      counts_norm = readRDS(paste0('out/frag_counts/', mark, '_', this_type_only, '_frag_counts.RDS'))
+    }
+    
+    # --- identify CREs
+    CRE_dir = paste0('out/CREs/')
+    dir.create(CRE_dir)
+    
+    # keep only regions with sufficient signal in sufficient samples
+    min_signal = quantile(counts_norm, prob = 0.90)
+    min_fraction_samples = 0.01 
+    keep = rowSums(counts_norm > min_signal) / ncol(counts_norm) > min_fraction_samples
+    counts_norm = counts_norm[keep,]
+    
+    # calculate CREs for all samples
+    message('testing correlation')
+    res = test_CREs(
+      counts = counts_norm,
+      meta = meta_subset,
+      corr_qvalue_threshold = 0.05,
+      top_n_by_sig = 1000,
+      trim_top_quantile = 0.05,
+      reset_low_ctDNA = TRUE
+    )
+    
+    pos_CREs = res[['pos_CREs']]
+    neg_CREs = res[['neg_CREs']]
+    corr_results = res[['corr_results']]
+    study_name = res[['study_name']]
+    
+    stopifnot(all(study_name == meta_subset$study_name)) # verify proper matching of between CRE results and samples in metasheet
+    meta_subset$pos_CRE_signal = res[['pos_CRE_signal']]
+    meta_subset$neg_CRE_signal = res[['neg_CRE_signal']]
+    meta_subset$CRE_delta = log(meta_subset$pos_CRE_signal / meta_subset$neg_CRE_signal,2)
+    
+    # write CREs to a bed file
+    write_regions_to_bed(regions = pos_CREs, 
+                         out_file = paste0(CRE_dir, '/', mark, '_', this_type_only, '_pos_CREs.bed'))
+    
+    write_regions_to_bed(regions = neg_CREs, 
+                         out_file = paste0(CRE_dir, '/', mark, '_', this_type_only, '_neg_CREs.bed'))
+    
+    write_regions_to_bed(regions = rownames(subset(corr_results, rho > 0 & significant)), 
+                         out_file = paste0(CRE_dir, '/', mark, '_', this_type_only, '_pos_CREs_sig.bed'))
+    
+    write_regions_to_bed(regions = rownames(subset(corr_results, rho < 0 & significant)), 
+                         out_file = paste0(CRE_dir, '/', mark, '_', this_type_only, '_neg_CREs_sig.bed'))
+            
+    # plot the distribution of correlation coefficients:
+    p = ggplot(corr_results, aes(x = rho,
+                                 fill = significant)) +
+      geom_histogram() +
+      ggtitle(paste0('spearman rho for ', mark, '_', this_type_only)) +
+      xlab('rho') +
+      geom_vline(xintercept = 0) +
+      theme_classic()
+    print(p)
+    
+    # plot CRE signal vs ctDNA
+    meta_subset = as.data.frame(meta_subset)
+    for(y_axis in c('CRE_delta', 'pos_CRE_signal', 'neg_CRE_signal')) {
+      tmp = cor.test(meta_subset[,y_axis], meta_subset$ctDNA, method = 'spearman')
+      p = ggplot(meta_subset, aes_string(y = y_axis, x = 'ctDNA')) +
+        geom_point(aes_string(col = 'cancer_type')) +
+        ggtitle(paste0(
+          mark, '_', this_type_only,
+          ': ', y_axis, ' vs ctDNA. corr=',
+          signif(tmp$estimate, 2),
+          ', p=',
+          signif(tmp$p.value, 2)
+        )) +
+        xlab('ctDNA') +
+        geom_smooth(method = 'lm', se = FALSE) +
+        theme_classic()
+      print(p)
+      
+      #for CREs calculated using all cancer types, plot CRE signals as a function of cancer type
+      if(this_type_only == 'all') {
+        p = ggplot(meta_subset, aes_string(y = y_axis, x = 'cancer_type', col = 'cancer_type')) +
+          geom_boxplot(width = 0.8, outlier.shape = NA) +
+          geom_jitter(width=0.3) +
+          theme_classic() +
+          ggtitle(paste0(mark, ': ', y_axis, ' by cancer type')) +
+          theme(axis.text.x = element_text(angle = 90, 
+                                           vjust = 1, 
+                                           hjust= 1))
+        print(p)
+      }
+    }
+    
+    dir.create('out/CREs/CRE_signal')
+    saveRDS(meta_subset[,c('study_name', 'pos_CRE_signal', 'neg_CRE_signal', 'CRE_delta')],
+             paste0('out/CREs/CRE_signal/CRE_signal_', mark, '_', this_type_only, '.RDS'))
+  }  
+}  
+  
+
+```
+
+``` {r merge_CREs}
+# merge CREs across marks. The output is used for GREAT enrichment analysis
+
+pos_CREs_merged = NULL
+neg_CREs_merged = NULL
+for(mark in unique(meta$antibody)) {
+
+  if(mark %in% c('LPWGS', 'H3K4me1')) next 
+    pos_CREs_merged = c(pos_CREs_merged, import(paste0('out/CREs/', mark, '_all_pos_CREs.bed')))
+    neg_CREs_merged = c(neg_CREs_merged, import(paste0('out/CREs/', mark, '_all_neg_CREs.bed')))
+}
+do.call(c, pos_CREs_merged) %>% GenomicRanges::reduce() %>% export(con='out/CREs/all_pos_CREs.bed')
+do.call(c, neg_CREs_merged) %>% GenomicRanges::reduce() %>% export(con='out/CREs/all_neg_CREs.bed')
+
+# make supplemental table output
+all_CREs = NULL
+for(mark in unique(meta$antibody)) {
+
+  if(mark %in% c('LPWGS', 'H3K4me1')) next 
+    tmp_pos_CREs = import(paste0('out/CREs/', mark, '_all_pos_CREs.bed'))
+    tmp_pos_CREs$mark = mark
+    tmp_pos_CREs$sign = 'positive'  
+    all_CREs = c(all_CREs, tmp_pos_CREs)
+    
+    tmp_neg_CREs = import(paste0('out/CREs/', mark, '_all_neg_CREs.bed'))
+    tmp_neg_CREs$mark = mark
+    tmp_neg_CREs$sign = 'negative'  
+    all_CREs = c(all_CREs, tmp_neg_CREs)
+}
+do.call(c, all_CREs) %>% 
+  write.table(row.names = FALSE, col.names = FALSE, quote = FALSE, sep = '\t', file = 'out/CREs/all_CREs.tsv')
+```
+
+Annotate peaks overlaps with genomic features, focusing on positive CREs
+``` {r annotate_CREs}
+
+library(ChIPseeker)
+
+txdb = TxDb.Hsapiens.UCSC.hg19.knownGene
+dir.create('out/CREs/annotations')
+
+
+for (mark in c('H3K4me3', 'H3K27ac', 'PanH3ac', 'MeDIP')) {
+
+    for (sign in c('pos', 'neg')) {
+    for (sig in c('_sig', '')) {
+      peak_file = paste0('out/CREs/', mark, '_all_', sign, '_CREs', sig, '.bed')
+      peaks = import(peak_file)
+      
+      peakAnno = annotatePeak(
+        peaks,
+        genomicAnnotationPriority = c(
+          "Promoter",
+          "5UTR",
+          "3UTR",
+          "Exon",
+          "Intron",
+          "Intergenic"
+        ),
+        tssRegion = c(-3000, 3000),
+        TxDb = txdb,
+        annoDb = "org.Hs.eg.db"
+      )
+      
+      # plot the top n CREs for each (not the signifcant ones only)
+      if (sig == '') {
+        p = plotAnnoBar(peakAnno, title = paste0(mark, ' ', sign, sig, ' CREs'))
+        print(p)
+      }
+      
+      # also save the annotation info as a dataframe
+      saveRDS(
+        peakAnno %>% as.data.frame(),
+        file = paste0(
+          'out/CREs/annotations/',
+          mark,
+          '_all_',
+          sign,
+          '_CREs',
+          sig,
+          '_anno.RDS'
+        )
+      )
+    }
+  }
+}
+
+
+```
+
+Plot examples of CREs, showing correlation between signal and ctDNA content
+
+``` {r plot_CRE_examples}
+genes_to_plot = c(
+  'MYC',
+  'EGFR',
+  'APC',
+  'PTEN',
+  'SOX9',
+  'SOX13',
+  'FOXA1',
+  'SPI1',
+  'EZH2',
+  'TERT'
+)
+
+ann_compiled = NULL # a dataframe to hold CRE annotations
+
+for (gene in genes_to_plot) {
+  for (mark in c('H3K4me3', 'H3K27ac', 'PanH3ac', 'MeDIP')) {
+    for (sign in c('pos', 'neg')) {
+      counts = readRDS(paste0('out/frag_counts/', mark, '_all_frag_counts.RDS'))
+      
+      # contains pairings of CREs with nearby genes
+      ann = readRDS(paste0(
+        'out/CREs/annotations/',
+        mark,
+        '_all_',
+        sign,
+        '_CREs_sig_anno.RDS'
+      ))
+      ann$region = paste0(ann$seqnames, ':', ann$start - 1, '-', ann$end)
+      ann = subset(ann, SYMBOL == gene)
+      
+      if (nrow(ann) == 0)
+        next
+      ann$mark = NA
+      ann$sign = NA
+      ann$gene = NA
+      ann$cor = NA
+      ann$p.value = NA
+
+      for (i in 1:nrow(ann)) {
+        region = ann$region[i]
+        meta_sub = subset(
+          meta,
+          antibody == mark &
+            (antibody == 'MeDIP' | enrichment*fragments > 4e7 & enrichment > 10) &
+            !is.na(cancer_type) &
+            cancer_type != 'Healthy'
+        )
+        
+        ix = match(colnames(counts), meta_sub$study_name)
+        toplot = data.frame(
+          counts = counts[region,],
+          ctDNA = meta_sub$ctDNA[ix],
+          cancer_type = meta_sub$cancer_type[ix],
+          cancer_subtype = meta_sub$cancer_subtype[ix]
+        ) 
+        
+        toplot = subset(toplot,!is.na(ctDNA))
+        cor = cor.test(toplot$counts, toplot$ctDNA, method = 'spearman') 
+        
+        ann$mark[i] = mark
+        ann$sign[i] = sign
+        ann$gene[i] = gene
+        ann$cor[i] = signif(cor$estimate, 2)
+        ann$p.value[i] = signif(cor$p.value, 2)
+        
+        p = ggplot(toplot, aes(y = counts, x = ctDNA)) +
+          geom_point(aes(col = cancer_type)) +
+          ggtitle(
+            paste0(
+              gene,
+              '\n',
+              region,
+              '\n',
+              mark,
+              ' counts vs. ctDNA. corr=',
+              signif(cor$estimate, 2),
+              ', p=',
+              signif(cor$p.value, 2)
+            )
+          ) +
+          geom_smooth(method = 'lm', se = FALSE) +
+          theme_classic()
+        print(p)
+      }
+      ann_compiled = rbind(ann_compiled, ann)
+      
+    }
+    
+  }
+}
+
+# save annotations to a tsv file:
+dir.create('out/CREs/examples')
+write.table(
+  ann_compiled[order(ann_compiled$p.value, decreasing = F), ],
+  file = 'out/CREs/examples/CRE_examples.tsv',
+  quote = FALSE,
+  sep = '\t',
+  row.names = FALSE,
+  col.names = TRUE
+)
+  
+```
+
+Summarize CRE signal. Estimate ctDNA content based on CRE signal and plot the correlation of estimates using different mark CREs for the same samples
+``` {r summarize_CRE_signal}
+
+# load metadata fresh
+metadata_file = 'data/metadata/Initial_manuscript_samples.xlsx'
+meta = read_xlsx(metadata_file, na = 'NA')
+meta$ctDNA = as.numeric(meta$ctDNA)
+
+for(this_type_only in c('all', unique(meta$cancer_type))) {
+  CRE_signal_merged = NULL
+  
+  if(this_type_only != 'all') {
+    meta_subset = subset(meta, cancer_type == this_type_only) 
+  } else {
+    meta_subset = meta
+  }
+  for(mark in unique(meta_subset$antibody)) {
+    if(mark %in% c('LPWGS', 'H3K4me1')) next
+    
+    CRE_signal_file = paste0('out/CREs/CRE_signal/CRE_signal_', mark, '_', this_type_only, '.RDS')
+    if(file.exists(CRE_signal_file)) {
+      CRE_signal = readRDS(CRE_signal_file)
+      CRE_signal$CREs_used = this_type_only
+
+    message('getting CRE-based ctDNA estimates for ', mark, '_', this_type_only)
+    ix = match(CRE_signal$study_name, meta_subset$study_name)
+    
+    # change any infinite values to NA (these can arise if there is 0 pos_CRE_signal, eg)
+    CRE_signal$CRE_delta[!is.finite(CRE_signal$CRE_delta)] = NA
+    CRE_signal$ctDNA_measured = meta_subset$ctDNA[ix]
+    CRE_signal$cancer_type = meta_subset$cancer_type[ix]
+    
+    # for fitting, only use samples with high QC and ichor estimates > 0.03
+    CRE_signal_to_fit = subset(CRE_signal, meta_subset$ctDNA[ix] > 0.03 & 
+                 (meta_subset$antibody[ix] == 'MeDIP' | 
+                    meta_subset$enrichment[ix] * meta_subset$fragments[ix] > 4e7 & 
+                    meta_subset$enrichment[ix] > 10) & 
+                   meta_subset$cancer_type[ix] != 'Healthy')
+    
+    # fit a model to predict ctDNA from CRE signal:
+    fit = lm(log((ctDNA_measured+0.01)/(1-(ctDNA_measured+0.01)),2) ~ CRE_delta, data = CRE_signal_to_fit)
+    pred = predict.lm(fit, newdata = CRE_signal)
+    CRE_signal$ctDNA_predicted_from_CREs = 2^pred/(1+2^pred)
+
+    if(TRUE && this_type_only == 'all') { # scale ctDNA estimates so that the median estimate for healthy samples is 0 for "all CRE" estimates
+      healthy_median_estimate = median(CRE_signal$ctDNA_predicted_from_CREs[CRE_signal$cancer_type == 'Healthy'],
+                                       na.rm = TRUE) 
+      CRE_signal$ctDNA_predicted_from_CREs = CRE_signal$ctDNA_predicted_from_CREs - healthy_median_estimate
+      CRE_signal$ctDNA_predicted_from_CREs[CRE_signal$ctDNA_predicted_from_CREs < 0] = 0
+    }
+    
+        
+    CRE_signal_merged = rbind(CRE_signal_merged, CRE_signal)
+    }
+  }
+  if(is.null(CRE_signal_merged)) next
+
+  meta_with_CREs = merge(meta_subset, CRE_signal_merged, by = c('study_name', 'cancer_type'), all.x = TRUE)
+
+  write.table(meta_with_CREs, paste0('out/CREs/CRE_signal/meta_', this_type_only, '_CRE_ctDNA_annotated.tsv'), sep = '\t', quote = F, row.names=F)
+  
+  # correlation between predicted ctDNA and measured ctDNA where available
+  for(mark in unique(meta_with_CREs$antibody)) {
+    if(mark %in% c('LPWGS', 'H3K4me1')) next
+    m = subset(meta_with_CREs, antibody == mark)
+    
+    if(TRUE) { # remove any low QC outliers
+      m = subset(m, 
+      antibody == 'MeDIP' | enrichment*fragments > 4e7 & enrichment > 10) 
+    }
+    if(all(is.na(m$ctDNA_predicted_from_CREs))) next
+    
+    # identify samples with high error in ctDNA estimates so we can label them on the plot 
+    m$error = abs(m$ctDNA_measured - m$ctDNA_predicted_from_CREs)    
+    m$high_error = m$error > quantile(m$error, probs = 0.9, na.rm = TRUE)
+    
+    tmp = cor.test(m$ctDNA_predicted_from_CREs, m$ctDNA, method = 'spearman')
+      p = ggplot(m, aes(y = ctDNA_predicted_from_CREs, x = ctDNA)) +  
+      geom_point(aes(col = cancer_type)) +
+      ggtitle(paste0(mark, ': CRE vs ichorCNA predictions of ctDNA content. corr=', 
+                     signif(tmp$estimate, 2), ', p=', 
+                     signif(tmp$p.value, 2))) +
+      geom_abline(slope = 1, intercept = 0, linetype = 'dashed') +
+      geom_text(data = subset(m, high_error), aes(label = study_name)) +
+      ylim(0,1) +  
+      xlim(0,1) +  
+      theme_classic()
+    print(p)
+    
+    if(this_type_only == 'all') {
+      
+    # boxplots of ctDNA estimates by cancer type
+    p = ggplot(m, aes(y = ctDNA_predicted_from_CREs, x = cancer_type, col = cancer_type)) +
+      geom_boxplot(width = 0.8, outlier.shape = NA) +
+      geom_jitter(width=0.3) +
+      theme_classic() +
+      ggtitle(paste0(mark, ': ctDNA estimated from CRE score by cancer type')) +
+      theme(axis.text.x = element_text(angle = 90, 
+                                       vjust = 1, 
+                                       hjust= 1))
+    print(p)
+    }
+  }
+  
+  if(this_type_only == 'all') {
+    toplot = meta_with_CREs
+  } else {
+    toplot = subset(meta_with_CREs, cancer_type == this_type_only)
+  }
+
+  toplot = toplot %>% 
+    subset(!antibody %in% c('LPWGS', 'H3K4me1')) %>% 
+    group_by(antibody, individual_id, cancer_type) %>% 
+        summarize(ctDNA_predicted = mean(ctDNA_predicted_from_CREs), ctDNA = mean(ctDNA)) %>% 
+    pivot_wider(names_from = antibody, values_from = ctDNA_predicted)
+
+  # some cases cause an error because there are not enough datapoints to calculate correlation. 
+  # For now, skip any column that has observations for fewer than 25% of samples
+
+  cols_to_plot = colnames(toplot)[colSums(!is.na(toplot)) >= (0.25 * nrow(toplot)) & !colnames(toplot) %in% c('individual_id', 'cancer_type')]
+  if(length(cols_to_plot) == 0) next
+  p = ggpairs(toplot, title = paste0('corr of ctDNA estimates for ',this_type_only),
+              columns = cols_to_plot)
+  print(p)
+}
+```
+
+
+``` {r assign_ctDNA_estimates}
+# give each sample a ctDNA estimate, with the following priority:
+# 1. if available, use ctDNA measured from LP-WGS
+# 2. if 1 is not available, use ctDNA calculated from CREs of the same cancer type
+# 3. if 2 is not available, use ctDNA calculated from CREs of all cancers
+
+# load metadata fresh
+metadata_file = 'data/metadata/Initial_manuscript_samples.xlsx'
+meta = read_xlsx(metadata_file, na = 'NA')
+meta$ctDNA = as.numeric(meta$ctDNA)
+
+meta$ctDNA_estimate = meta$ctDNA
+meta$ctDNA_estimate_source = ifelse(is.na(meta$ctDNA_estimate), NA, 'LP-WGS')
+
+for(this_type_only in c(unique(meta$cancer_type), 'all')) {
+  message('looking for ctDNA estimates from CREs from ', this_type_only)
+  
+  meta_file = paste0('out/CREs/CRE_signal/meta_', this_type_only, '_CRE_ctDNA_annotated.tsv')
+  if(file.exists(meta_file)) {
+    lookup_table = read.table(meta_file, header=TRUE, sep = '\t')
+  } else {
+    next
+  }
+  lookup_table = subset(lookup_table, !is.na(CREs_used) & !is.na(ctDNA_predicted_from_CREs))
+
+  # find indexes for missing ctDNA estimates in metasheet:
+  needs_ctDNA_estimate = is.na(meta$ctDNA_estimate)
+  has_ctDNA_estimate_in_lookup = !is.na(lookup_table$ctDNA_predicted_from_CREs)
+
+  names_to_fill_in = intersect(meta$study_name[needs_ctDNA_estimate], 
+                                 lookup_table$study_name[has_ctDNA_estimate_in_lookup])
+  
+  ix = match(names_to_fill_in, lookup_table$study_name)
+
+  meta$ctDNA_estimate[meta$study_name %in% lookup_table$study_name[ix]] = lookup_table$ctDNA_predicted_from_CREs[ix]
+  meta$ctDNA_estimate_source[meta$study_name %in% lookup_table$study_name[ix]] = paste0(lookup_table$CREs_used[ix], '_CREs')
+
+}
+write.table(meta, 'out/CREs/meta_with_CRE_based_ctDNA_annotations.tsv', sep = '\t', quote = F, row.names=F)
+```
+
+Generate profile plots aggregating cfChIP singal at TF binding sites
+```{r TF_binding_site_signal_analysis}
+
+# load metadata with ctDNA estimates:
+meta = read.table('out/CREs/meta_with_CRE_based_ctDNA_annotations.tsv', header = TRUE, as.is = TRUE, sep = '\t')
+#meta = subset(meta, antibody%in% c('H3K4me3', 'H3K27ac', 'PanH3ac'))
+meta = subset(meta, antibody%in% c('H3K4me3', 'H3K27ac'))
+
+if(FALSE) { #apply qc filters
+    meta = subset(meta, enrichment > 10)
+    meta = subset(meta, fragments > 2e6)
+    
+    
+  }
+
+# relabel subtypes as needed - data in all plots will be grouped based on subtype annotations
+meta$cancer_subtype[grepl('ER\\-', meta$cancer_subtype)] = 'ER-'
+meta$cancer_subtype[grepl('ER\\+', meta$cancer_subtype)] = 'ER+'
+meta$cancer_subtype[meta$cancer_type == 'SCLC'] = 'SCLC'
+meta$cancer_subtype[meta$cancer_type == 'NSCLC'] = 'NSCLC'
+meta$cancer_subtype[meta$cancer_type == 'Healthy'] = 'Healthy'
+meta$cancer_subtype[meta$cancer_type == 'Renal'] = 'Renal'
+
+# prepare sites
+sites_file_list = list(
+
+  'data/sites/ASCL1_merged_hg19.bed',
+  'data/sites/Adeno_over_NEwithMCC.deseq.Padj0.01.LG2FC.-2.down.bed', # ATAC sites that are up in NE samples
+  'data/sites/ESR1_promoter.bed',
+  'data/sites/ER_pos_ATAC_hg19.bed',
+  'data/sites/ER_neg_ATAC_hg19.bed',
+  'data/sites/AR_merged_hg19.bed',
+  'data/sites/FOXA1_promoter.bed',
+  'data/sites/FOXA1_NEPC_up.bed',
+  'data/sites/FOXA1_PRAD_up.bed',  
+  'data/sites/FOXA1_unchanged.bed',
+  'data/sites/HIF1308M.rep1_summits.bed',
+  'data/sites/top_common_DHS.bed',
+  'data/sites/TCGA_ATAC_COAD.bed',
+  'data/sites/TCGA_ATAC_BRCA.bed',  
+  'data/sites/TCGA_ATAC_KIRC.bed',  
+  'data/sites/TCGA_ATAC_LIHC.bed',    
+  'data/sites/TCGA_ATAC_LUAD.bed',    
+  'data/sites/TCGA_ATAC_PRAD.bed'    
+  )
+
+# Filter out healthy sites from bed files as desired, then pass them to sites_list
+# list healthy H3K27ac cfChIP peaks
+
+# Use peaks from other cancer types that won't be analyzed, limiting ot those wtih ctDNA = 0. This is done to preserve healthy samples for comparisons
+healthy_peaks_files = meta$peak_file[meta$cancer_type %in% c('Glioma', 'Ovarian', 'Thymic', 'Melanoma') &
+                                    meta$ctDNA_estimate == 0 &
+                                       meta$antibody == 'H3K27ac']
+
+
+#remove these samples used for healthy filtering from the metasheet so they are not used in comparisons later in this section
+meta = subset(meta, !peak_file %in% healthy_peaks_files)
+healthy_peaks_files = healthy_peaks_files %>% str_replace('.*/', 'data/peaks/')
+peaks = lapply(healthy_peaks_files, import)
+healthy_peaks = do.call(c, peaks) %>% GenomicRanges::reduce()
+
+dir.create('out/TFBS/filtered_sites')
+
+for(sites_file in sites_file_list) {
+  sites = import(sites_file)
+  sites = sites[!(sites %over% healthy_peaks)] 
+  out_file = sites_file %>% 
+    str_replace('.*/', 'out/TFBS/filtered_sites/') %>% 
+    str_replace('.bed', '_healthy_filtered.bed')
+  export(sites, con = out_file)
+}
+
+# update sites_file_list with the filtered sites where desired ( we don't filter out healthy peaks for DHS, eg, because it is used for normalization)
+sites_file_list = ifelse(
+  grepl('DHS|PU|promoter', sites_file_list),
+  sites_file_list,
+  sites_file_list %>%
+    str_replace('.*/', 'out/TFBS/filtered_sites/') %>%
+    str_replace('.bed', '_healthy_filtered.bed')
+)
+
+# prepare sites
+message('tiling sites')
+sites_list = tile_sites(sites_file_list, exclude_regions = exclude_regions)
+
+sites_names = str_replace(sites_file_list, '.*/', '') %>%
+  str_replace('.rep1_sorted_peaks.narrowPeak.bed', '') %>%
+  str_replace('.bed', '') %>%
+  str_replace('hg19', '')
+
+
+# --- Breast cancer ER analyses:
+if(TRUE) {
+meta_sub = subset(meta, cancer_subtype %in% c('ER+', 'ER-'))
+keep_sites = grepl('ESR1|ER|DHS', sites_names)
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+
+saveRDS(toplot, paste0('out/TFBS/Breast_profiles.RDS'))
+}
+
+# --- EGFR transformed lung cancer analyses:
+if(TRUE) {
+meta_sub = meta[meta$study_name %in% c('k27_050_tp4', 'K27_MGHDNA050tp1'),] 
+keep_sites = grepl('NE|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/EGFR_Lung_profiles.RDS'))
+}
+
+# --- AR Prostate:
+if(TRUE) {
+meta_sub = subset(meta, antibody == 'H3K27ac' & (cancer_type %in% c('Prostate', 'Healthy')))
+keep_sites = grepl('AR|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Prostate_AR_profiles.RDS'))
+}
+
+# --- VHL RCC:
+if(TRUE) {
+meta_sub = subset(meta, antibody == 'H3K27ac' & (cancer_type %in% c('Renal', 'Healthy')))
+keep_sites = grepl('HIF|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Renal_profiles.RDS'))
+}
+
+# --- multi-NE analysis:
+if(TRUE) {
+meta_sub = subset(meta, (cancer_subtype %in% c('Adenocarcinoma', 'PRAD', 'NEPC', 'SCLC', 'NSCLC', 'EGFRm Post-tSCLC', 'Small cell bladder') | cancer_type %in% c('Merkel cell', 'Colorectal')) &
+                    antibody == 'H3K27ac')
+keep_sites = grepl('Adeno_over_NEwithMCC.deseq.Padj0.01.LG2FC.-2.down|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Multi_NE_profiles.RDS'))
+}
+
+if(TRUE) {
+# --- Prostate cancer ASCL1 / FOXA1 analyses:
+meta_sub = subset(meta, cancer_subtype %in% c('PRAD', 'NEPC'))
+keep_sites = grepl('NE|ASCL1|FOXA1|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Prostate_profiles.RDS'))
+}
+
+if(TRUE) {
+# --- TCGA ATAC CRC 
+meta_sub = subset(meta, cancer_type %in% c('Colorectal', 'Healthy') & 
+                    antibody == 'H3K27ac')
+keep_sites = grepl('COAD|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/CRC_ATAC_profiles.RDS'))
+}
+
+
+if(TRUE) {
+# --- TCGA ATAC Breast 
+meta_sub = subset(meta, cancer_type %in% c('Breast', 'Healthy') & 
+                    antibody == 'H3K27ac')
+meta_sub$cancer_subtype[meta_sub$cancer_type == 'Breast'] = 'Breast'
+
+keep_sites = grepl('BRCA|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Breast_ATAC_profiles.RDS'))
+}
+
+
+if(TRUE) {
+# --- TCGA ATAC Renal 
+meta_sub = subset(meta, cancer_type %in% c('Renal', 'Healthy') & 
+                    antibody == 'H3K27ac')
+meta_sub$cancer_subtype[meta_sub$cancer_type == 'Renal'] = 'Renal'
+
+keep_sites = grepl('KIRC|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Renal_ATAC_profiles.RDS'))
+}
+
+
+if(TRUE) {
+# --- TCGA ATAC HCC 
+meta_sub = subset(meta, cancer_type %in% c('Hepatocellular', 'Healthy') & 
+                    antibody == 'H3K27ac')
+
+keep_sites = grepl('LIHC|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/HCC_ATAC_profiles.RDS'))
+}
+
+
+if(TRUE) {
+# --- TCGA ATAC LUAD 
+meta_sub = subset(meta, cancer_type %in% c('NSCLC', 'Healthy') & 
+                    antibody == 'H3K27ac')
+meta_sub$cancer_subtype[meta_sub$cancer_type == 'NSCLC'] = 'NSCLC'
+
+keep_sites = grepl('LUAD|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/NSCLC_ATAC_profiles.RDS'))
+}
+
+
+if(TRUE) {
+# --- TCGA ATAC PRAD 
+meta_sub = subset(meta, cancer_type %in% c('Prostate', 'Healthy') & 
+                    antibody == 'H3K27ac')
+
+keep_sites = grepl('PRAD|DHS', sites_names) 
+
+toplot = NULL
+count = 1
+tot = nrow(meta_sub)
+for(rds in meta_sub$rds_file) {
+  message('processing ', rds, ' --- ', count, ' of ', tot)
+  counts = signal_at_sites(
+    frags_file = rds,
+    sites_list = sites_list[keep_sites],
+    sites_names = sites_names[keep_sites],
+    remove_peaks_wider_than = 4000
+  )
+  counts$cancer_type = meta_sub$cancer_type[meta_sub$rds_file == rds]
+  counts$cancer_subtype = meta_sub$cancer_subtype[meta_sub$rds_file == rds]
+  counts$study_name = meta_sub$study_name[meta_sub$rds_file == rds]
+  toplot = rbind(toplot, counts)
+  count = count + 1
+}
+saveRDS(toplot, paste0('out/TFBS/Prostate_ATAC_profiles.RDS'))
+}
+
+```
+
+``` {r plot_profiles_targeted}
+# load metadata with ctDNA estimates:
+meta = read.table('out/CREs/meta_with_CRE_based_ctDNA_annotations.tsv', header = TRUE, as.is = TRUE, sep = '\t')
+meta = subset(meta, antibody%in% c('H3K4me3', 'H3K27ac'))
+
+meta = subset(meta, (enrichment * fragments > 4e7) & #(redundant with the condition below, but here for consistency)
+                enrichment > 10 & 
+                fragments > 4e6) 
+
+
+# relabel subtypes as needed - data in all plots will be grouped based on subtype annotations
+meta$cancer_subtype[grepl('ER\\-', meta$cancer_subtype)] = 'ER-'
+meta$cancer_subtype[grepl('ER\\+', meta$cancer_subtype)] = 'ER+'
+meta$cancer_subtype[meta$cancer_type == 'SCLC'] = 'SCLC'
+meta$cancer_subtype[meta$cancer_type == 'NSCLC' & meta$cancer_subtype == 'Adenocarcinoma'] = 'LUAD'
+meta$cancer_subtype[meta$cancer_type == 'Healthy'] = 'Healthy'
+meta$cancer_subtype[meta$cancer_type == 'Renal'] = 'Renal'
+
+plot_params_list = list(
+
+  list('CRC_ATAC', 'H3K27ac', 'TCGA_ATAC_COAD_healthy_filtered', 'top_common_DHS'),  
+  list('Breast_ATAC', 'H3K27ac', 'TCGA_ATAC_BRCA_healthy_filtered', 'top_common_DHS'),    
+  list('Renal_ATAC', 'H3K27ac', 'TCGA_ATAC_KIRC_healthy_filtered', 'top_common_DHS'),
+  list('HCC_ATAC', 'H3K27ac', 'TCGA_ATAC_LIHC_healthy_filtered', 'top_common_DHS'),
+  list('NSCLC_ATAC', 'H3K27ac', 'TCGA_ATAC_LUAD_healthy_filtered', 'top_common_DHS'),
+  list('Prostate_ATAC', 'H3K27ac', 'TCGA_ATAC_PRAD_healthy_filtered', 'top_common_DHS'),
+  list('Breast', 'H3K4me3', 'ESR1_promoter', 'top_common_DHS'),
+  list('Breast', 'H3K27ac', 'ER_pos_ATAC__healthy_filtered', 'ER_neg_ATAC__healthy_filtered'),
+  list('Prostate', 'H3K27ac', 'ASCL1_merged__healthy_filtered', 'top_common_DHS'),
+  list('Prostate', 'H3K4me3', 'FOXA1_promoter', 'top_common_DHS'),
+  list('Prostate', 'H3K27ac', c('FOXA1_PRAD_up_healthy_filtered', 'FOXA1_NEPC_up_healthy_filtered'), 'FOXA1_unchanged_healthy_filtered'),
+  list('Prostate_AR', 'H3K27ac', 'AR_merged__healthy_filtered', 'top_common_DHS'),
+  list('EGFR_Lung', 'H3K27ac', 'ASCL1_merged__healthy_filtered', 'top_common_DHS'),
+  list('Renal', 'H3K27ac', 'HIF1308M.rep1_summits_healthy_filtered', 'top_common_DHS'),
+  list('Multi_NE', 'H3K27ac', 'Adeno_over_NEwithMCC.deseq.Padj0.01.LG2FC.-2.down_healthy_filtered', 'top_common_DHS'),
+  list('EGFR_Lung', 'H3K27ac', 'Adeno_over_NEwithMCC.deseq.Padj0.01.LG2FC.-2.down_healthy_filtered', 
+ 'top_common_DHS') 
+
+)
+
+dir.create('out/TFBS/scores')
+for(plot_params in plot_params_list){
+cancer_type = plot_params[[1]]
+mark = plot_params[[2]]
+sites_to_plot = plot_params[[3]]
+normalize_to = plot_params[[4]]
+
+  toplot = readRDS(paste0('out/TFBS/', cancer_type, '_profiles.RDS'))
+  
+  toplot = merge(toplot[, !colnames(toplot) %in% c('cancer_type', 'cancer_subtype')], # don't include cancer_type and cancer_subtype because these may have been modified in toplot for the comparisons above.,
+                 meta,
+                 by = 'study_name')  
+  
+  # since comparisons below are made based on subtype, use the cancer type in place of subtype if subtype is NA
+  toplot$cancer_subtype[is.na(toplot$cancer_subtype)] = toplot$cancer_type[is.na(toplot$cancer_subtype)]
+  
+  # if there are multiple samples for an individual, only use the one with the most fragments, except for pre-post samples:
+  if(cancer_type!='EGFR_Lung'){
+  keep = meta %>% group_by(individual_id, antibody) %>% slice_max(order_by = fragments) %>% 
+dplyr::select(study_name)
+  toplot = subset(toplot, study_name %in% keep$study_name)
+  }
+  
+  
+  if(TRUE & cancer_type != 'Multi_NE') { # subset on ctDNA estimate (except for Multi-NE analysis)
+     toplot = subset(toplot, !is.na(ctDNA_estimate) & ctDNA_estimate > 0.03 | cancer_type == 'Healthy')
+  }
+
+    if(cancer_type == 'Prostate_AR') {
+      toplot = subset(toplot, cancer_subtype %in% c('PRAD', 'Healthy'))
+    }
+
+
+  if(cancer_type == 'Breast_ATAC') {
+    toplot$cancer_subtype[toplot$cancer_type == 'Breast'] = 'Breast'
+                      
+    }
+  if(cancer_type == 'NSCLC_ATAC') {
+    toplot$cancer_subtype[toplot$cancer_type == 'NSCLC'] = 'NSCLC'
+                      
+    }  
+  
+  if(cancer_type == 'Multi_NE') {
+    # remove any that are not adenocarcinoma or NE
+    toplot = subset(toplot, cancer_subtype %in% c('SCLC', 'LUAD', 'NEPC', 'PRAD', 'MCV+', 'Small cell bladder', 'EGFRm Post-tSCLC', 'Colorectal'))
+
+    toplot$cancer_subtype = ifelse(toplot$cancer_subtype %in% c('PRAD', 'LUAD', 'Colorectal'), 'non-NE', 'NE')
+    
+    #exclude irAE lung samples and PRAD that is more likely to have occult NEPC based on risk factors (TP53+RB1 mutant, etc.)
+    toplot = subset(toplot, !grepl('D.*R1', study_name))
+
+      }
+    }
+
+      for (boxplot_arg in c(FALSE, TRUE)) {
+      p = plot_signal_at_sites(
+        subset(toplot,
+               antibody %in% mark & sites %in% c(sites_to_plot, normalize_to)),
+        normalize_to_these_sites = normalize_to,
+        subtract_shoulder = TRUE,
+        group_by_this = 'cancer_subtype',
+
+        auc_boxplot = boxplot_arg,
+        out_file = paste0('out/TFBS/scores/', cancer_type, '_', paste0(mark, collapse = ''), '_', sites_to_plot[1], '_', normalize_to, '.tsv')
+      )
+      suppressWarnings(print(p))
+      }
+}  
+
+```
+
+Multi-NE classifier
+```{r multi_NE_classifier}
+scores_file = 'out/TFBS/scores/Multi_NE_H3K27ac_Adeno_over_NEwithMCC.deseq.Padj0.01.LG2FC.-2.down_healthy_filtered_top_common_DHS.tsv'
+
+scores = read.table(scores_file, sep = '\t', header = TRUE)
+
+scores$cancer_type[scores$cancer_type == 'Prostate'] = 'PRAD'
+scores = subset(scores, sites == "Adeno_over_NEwithMCC.deseq.Padj0.01.LG2FC.-2.down_healthy_filtered")
+scores$cancer_type[scores$cancer_type == 'EGFRm Post-tSCLC'] = 'SCLC'
+scores$cancer_type = factor(scores$cancer_type, levels = c('NEPC', 'Small cell bladder', 'SCLC', 'Merkel cell', 'PRAD', 'NSCLC', 'Colorectal'))
+
+cols = c('NE' = 'darkorange', 'non-NE' = 'darkgray')
+  
+p = ggplot(scores, aes(y = auc, x = cancer_type, col = cancer_subtype)) +
+    geom_boxplot(width = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.3) +
+    theme_classic() +
+    scale_color_manual(values = cols) 
+print(p)
+           
+
+# --- ROC curves
+
+pred = prediction(scores$auc, scores$cancer_subtype == 'NE')  
+perf = performance(pred, 'tpr', 'fpr')
+auc_all = unlist(performance(pred, 'auc')@y.values) %>% round(digits = 2)
+
+perf_df = data.frame(FPR = unlist(perf@x.values), 
+                     TPR = unlist(perf@y.values),
+                     comparison = 'all NE vs. non-NE')
+
+# add just PRAD vs NEPC
+pred = prediction(scores$auc[scores$cancer_type %in% c('NEPC', 'PRAD')], scores$cancer_subtype[scores$cancer_type %in% c('NEPC', 'PRAD')]  == 'NE')  
+perf = performance(pred, 'tpr', 'fpr')
+auc_NEPC_vs_PRAD = unlist(performance(pred, 'auc')@y.values) %>% round(digits = 3)
+
+perf_df = rbind(perf_df, data.frame(FPR = unlist(perf@x.values), 
+                                    TPR = unlist(perf@y.values),
+                                    comparison = 'NEPC vs. PRAD'))
+
+# add just SCLC vs NSCLC
+pred = prediction(scores$auc[scores$cancer_type %in% c('SCLC', 'NSCLC')], scores$cancer_subtype[scores$cancer_type %in% c('SCLC', 'NSCLC')]  == 'NE')  
+perf = performance(pred, 'tpr', 'fpr')
+auc_SCLC_vs_NSCLC = unlist(performance(pred, 'auc')@y.values) %>% round(digits = 3)
+
+perf_df = rbind(perf_df, data.frame(FPR = unlist(perf@x.values), 
+                                    TPR = unlist(perf@y.values),
+                                    comparison = 'SCLC vs. NSCLC'))
+
+# add just Merkel vs all non-NE
+pred = prediction(scores$auc[scores$cancer_type %in% c('Merkel cell', 'PRAD', 'NSCLC', 'Colorectal')], scores$cancer_subtype[scores$cancer_type %in% c('Merkel cell', 'PRAD', 'NSCLC', 'Colorectal')]  == 'NE')  
+perf = performance(pred, 'tpr', 'fpr')
+auc_Merkel_vs_non_NE = unlist(performance(pred, 'auc')@y.values) %>% round(digits = 3)
+
+perf_df = rbind(perf_df, data.frame(FPR = unlist(perf@x.values), 
+                                    TPR = unlist(perf@y.values),
+                                    comparison = 'Merkel vs non-NE'))
+
+p = ggplot(perf_df, aes(y=TPR, x=FPR, col = comparison)) +
+  geom_path() +
+  ggtitle('ROC for detection of NE-diff') +
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed') +
+  scale_color_manual(values = c('darkgreen', 'darkorange', 'darkblue', 'darkred'), 
+                    name = 'Comparison',
+                    breaks = c('all NE vs. non-NE', 
+                             'NEPC vs. PRAD', 
+                             'SCLC vs. NSCLC',
+                             'Merkel vs non-NE'), 
+                    labels = c(paste0('all NE vs. non-NE (AUC = ', auc_all, ')'), 
+                             paste0('NEPC vs. PRAD (AUC = ', auc_NEPC_vs_PRAD, ')'), 
+                             paste0('SCLC vs. NSCLC (AUC = ', auc_SCLC_vs_NSCLC, ')'),
+                             paste0('Merkel vs non-NE (AUC = ', auc_Merkel_vs_non_NE, ')'))) +
+
+  theme_classic() +
+  theme(legend.position = c(0.75, 0.25))
+print(p)
+
+```
+
+Look at QC cutoffs (may not need this ultimately):
+
+```{r qc_cutoffs}
+meta_file = 'out/CREs/meta_with_CRE_based_ctDNA_annotations.tsv'
+meta = read.table(meta_file, sep = '\t', header=T, stringsAsFactors = FALSE)
+meta = subset(meta, antibody %in% c('H3K4me3', 'H3K27ac', 'PanH3ac'))
+prod = 4e7 # cutoff for enrichment * fragments
+
+cut_data = data.frame(y = seq(1e5, 6e7, by = 1e6))
+cut_data$x = prod / cut_data$y
+p = ggplot(meta, aes(y=fragments, x = enrichment)) +
+  geom_point() +
+  theme_classic() +
+  geom_hline(yintercept = 2e6, col = 'red') +
+  geom_vline(xintercept = 10, col = 'red') +
+  facet_wrap(~ antibody) +
+  geom_line(data = cut_data, aes(y = y, x = x), col = 'blue', linetype = 'dashed')
+print(p)
+
+
+p = p + ylim(0, 2e7) + xlim(0,200)
+print(p)
+
+p = p + ylim(0, 5e6) + xlim(0,40)
+print(p)
+
+for(antibody in c('H3K4me3', 'H3K27ac', 'PanH3ac')) {
+  
+tmp1 = sum(meta$antibody == antibody & meta$fragments > 2e6 & meta$enrichment > 10)
+tmp2 = sum(meta$antibody == antibody & meta$fragments * meta$enrichment > prod)
+message(antibody, ': ', tmp1, ' vs ', tmp2)
+}
+```
+
+Identify cancer/tissue-specific genes as defined in the human protein atlas here: https://www.proteinatlas.org/download/proteinatlas.tsv.zip
+
+Promoter signal at these genes is used as input for the classifier.
+
+Here is an explanation from the HPA website (https://www.proteinatlas.org/humanproteome/tissue/tissue+specific) of how they define elevated expression and tissue specificity:
+Elevated expression includes three subcategory types of elevated expression:
+
+Tissue enriched: At least four-fold higher mRNA level in a particular tissue compared to any other tissue.
+Group enriched: At least four-fold higher average mRNA level in a group of 2-5 tissues compared to any other tissue.
+Tissue enhanced: At least four-fold higher mRNA level in a particular tissue compared to the average level in all other tissues.
+Distribution, on the other hand, visualizes how many genes have, or do not have, detectable levels (nTPM≥1) of transcribed mRNA molecules. As evident in Table 1, all elevated genes are categorized as:
+
+Detected in single: Detected in a single tissue
+Detected in some: Detected in more than one but less than one third of tissues
+Detected in many: Detected in at least a third but not all tissues
+Detected in all: Detected in all tissues
+
+```{r hpa_annotation}
+
+# read in metadata with ctDNA estimates
+meta_file = 'out/CREs/meta_with_CRE_based_ctDNA_annotations.tsv'
+meta = read.table(meta_file, sep = '\t', header=T, stringsAsFactors = FALSE)
+
+# read in data from the Human Protein Atlas
+hpa_file='data/hpa/proteinatlas.tsv'
+counts_file = 'out/frag_counts/H3K4me3_all_frag_counts.RDS'
+liftover_chain_file = 'data/liftover/hg38ToHg19.over.chain'
+
+hpa = read.table(hpa_file, sep = '\t', header = TRUE, fill = TRUE, quote = '"')
+hpa = subset(hpa, Evidence %in% c('Evidence at transcript level', 'Evidence at protein level'))
+hpa$coords = paste(hpa$Chromosome, hpa$Position, sep = ':')
+hpa$coords = paste0('chr', hpa$coords)
+
+# lift over gene coords form hg38 to hg19
+coords = as(hpa$coords, 'GRanges')
+chain = import.chain(liftover_chain_file)
+coords_hg19 = liftOver(coords, chain) 
+
+# remove any entries that didn't have one unique mapping
+uniquely_mapped = sapply(coords_hg19, FUN = function(x) {length(x) == 1})
+
+# store hpa in case we want to recover genes that get removed when remapping to hg19
+hpa_tmp = hpa
+
+hpa = subset(hpa, uniquely_mapped)
+coords_hg19 = coords_hg19[uniquely_mapped] %>% unlist()
+hpa$coords_hg19 = coords_hg19 %>% as('character')
+
+hpa$hpa_is_spec = hpa$RNA.tissue.specificity %in% c('Tissue enhanced', 'Tissue enriched') &
+                    hpa$RNA.blood.cell.specificity == 'Not detected in immune cells'
+
+hpa$hpa_is_common =   hpa$RNA.tissue.specificity == 'Low tissue specificity' &
+                    hpa$RNA.tissue.distribution == 'Detected in all' &
+                    hpa$RNA.single.cell.type.specificity == 'Low cell type specificity' &
+                    hpa$RNA.cell.line.specificity == 'Low cancer specificity'
+
+# load counts matrix and annotate with gene info
+counts = readRDS(counts_file)
+counts_coords = rownames(counts) %>% as('GRanges')
+ol = findOverlaps(counts_coords, coords_hg19)
+
+# for now, keep only peaks that overlap with a single gene:
+ol = subset(ol, !duplicated(from(ol)))
+counts_df = as.data.frame(counts)
+
+counts_df$hpa_gene = NA
+counts_df$hpa_is_spec = NA
+counts_df$hpa_is_common = NA
+counts_df$hpa_tissue_type = NA
+counts_df$hpa_cancer_specific_fpkm = NA
+counts_df$hpa_single_cell_nTPM = NA
+counts_df$hpa_tissue_distribution = NA
+counts_df$hpa_blood_cell_specificity = NA
+
+counts_df$hpa_gene[from(ol)] = hpa$Gene[to(ol)]
+counts_df$hpa_is_spec[from(ol)] = hpa$hpa_is_spec[to(ol)]
+counts_df$hpa_is_common[from(ol)] = hpa$hpa_is_common[to(ol)]
+counts_df$hpa_tissue_type[from(ol)] = hpa$RNA.tissue.cell.type.enrichment[to(ol)]
+counts_df$hpa_cancer_specific_fpkm[from(ol)] = hpa$RNA.cancer.specific.FPKM[to(ol)]
+counts_df$hpa_single_cell_nTPM[from(ol)] = hpa$RNA.single.cell.type.specific.nTPM[to(ol)]
+counts_df$hpa_tissue_distribution[from(ol)] = hpa$RNA.tissue.distribution[to(ol)]
+counts_df$hpa_blood_cell_specificity[from(ol)] =hpa$RNA.blood.cell.specificity[to(ol)]
+
+counts_df$peaks = rownames(counts_df)
+counts_df$hpa_is_blood_cell_specific = grepl('Immune cell enriched', counts_df$hpa_blood_cell_specificity, ignore.case = TRUE)
+
+dir.create('out/classification')
+
+counts_df$for_classification = rowSums(counts_df[,grepl('hpa_is_spec_', colnames(counts_df))]) > 0
+saveRDS(counts_df, file='out/classification/counts_df.RDS')
+```
+
+
+``` {r plot_tissue_specific_markers}
+
+# read in metadata with ctDNA estimates
+meta_file = 'out/CREs/meta_with_CRE_based_ctDNA_annotations.tsv'
+meta = read.table(
+  meta_file,
+  sep = '\t',
+  header = T,
+  stringsAsFactors = FALSE
+)
+meta = subset(meta, antibody == 'H3K4me3')
+
+# adjust the cancer_type annotation to capture the subtypes we want to compare
+meta$cancer_type[meta$cancer_subtype == 'ER+'] = 'Breast cancer (ER+)'
+meta$cancer_type[meta$cancer_subtype == 'Triple-negative'] = 'Breast cancer (ER-)'
+
+meta$cancer_type[meta$cancer_type == 'NSCLC' &
+                   meta$cancer_subtype == 'Adenocarinoma'] = 'Lung (adenocarcinoma)'
+meta$cancer_type[meta$cancer_type == 'NSCLC' &
+                   meta$cancer_subtype == 'Squamous'] = 'Lung (squamous)'
+
+txdb = TxDb.Hsapiens.UCSC.hg19.knownGene
+
+if (FALSE)  {
+  # regenerate counts file, adding custom peak that were not captured in the original
+  # load all peaks and merge them
+  
+  peak_files = meta$peak_file %>% str_replace('.*/', 'data/peaks/')
+  keep = !is.na(meta$peak_file) & meta$peak_file != 'NA'
+  
+  peak_files = peak_files[keep]
+  peaks = lapply(peak_files, import)
+  targets = do.call(c, peaks) %>% GenomicRanges::reduce(min.gapwidth = 0)
+  
+  # remove noisy regions that should be excluded
+  exclude_regions = import(exclude_regions_file, format = 'bed')
+  targets = targets[!(targets %over% exclude_regions) &
+                      !(seqnames(targets) %in% c('chrY', 'chrM'))]
+  
+  # add custom targets - this is to capture important sites where peaks were not called or get filtered out
+  peaks_to_add = GRanges(
+    c(
+      'chrX:66763249-66769107', #AR
+      'chr3:189507330-189511065', #TP63
+      'chr19:51357957-51362418', #KLK3
+      'chr11:60869919-60871192', #CD5
+      'chr4:74269941-74277153'#ALB
+    )) 
+  targets = c(targets, peaks_to_add)
+  
+  # export a bed file with target regions
+  dir.create('out/classification/union_peaks/', recursive = TRUE)
+  export(
+    targets,
+    con = paste0(
+      'out/classification/union_peaks/H3K4me3_all_union_peaks.bed'
+    ),
+    format = 'bed'
+  )
+  
+  frag_files = meta$rds_file
+  
+  dir.create('out/classification/frag_counts', recursive = TRUE)
+  
+  for (norm_set in c('all', 'chr17'))  {
+    # generate two files, one normalizing to chr17q (for ERBB2) and one normalizing to all DHS sites
+    
+    if (norm_set == 'chr17') {
+      #normalize wrt chr17 CREs
+      cres = import('out/CREs/H3K4me3_all_pos_CREs_sig.bed') %>%
+        subset(seqnames %in% 'chr17' &
+                 start > 25844727) #corresponds to chr17q
+      erbb2_region = GRanges('chr17:37639292-38101225')
+      norm_sites = cres[!cres %over% erbb2_region]
+      frag_files = meta$rds_file[!is.na(meta$HER2)]
+      targets = GRanges('chr17:37856150-37857953') #ERBB2 promoter
+      
+    } else {
+      # load file for normalization - this uses the top 10,000 DHS sites by recurrence across samples from Boix et al Nature
+      norm_sites = import('data/sites/top_common_DHS.bed') %>% resize(width = 2000, fix = 'center')
+    }
+    
+    
+    counts_df = frag_counts(
+      frag_files,
+      sample_names = meta$study_name[meta$rds_file %in% frag_files],
+      targets = targets,
+      normalize = norm_sites
+    )
+    
+    
+    saveRDS(
+      counts_df,
+      paste0(
+        'out/classification/frag_counts/H3K4me3_all_frag_counts_',
+        norm_set,
+        '_norm.RDS'
+      ))
+  }
+}
+  
+  counts_df = readRDS('out/classification/frag_counts/H3K4me3_all_frag_counts_all_norm.RDS')
+  counts_df_extra = readRDS('out/classification/frag_counts/H3K4me3_all_frag_counts_chr17_norm.RDS')
+
+  #find HER2 promoter peak
+  tmp = rownames(counts_df)[grep('chr17:378', rownames(counts_df))] %>% GRanges()
+  her2_rowname = subset(tmp, start < 37856317 & end > 37856317) %>% as.character()
+
+  # replace entries at her2 locus:
+  counts_df[her2_rowname, colnames(counts_df_extra)] = as.numeric(counts_df_extra)
+    
+peaks = rownames(counts_df) %>% GRanges()
+peakAnno = annotatePeak(
+  peaks,
+  tssRegion = c(-3000, 3000),
+  TxDb = txdb,
+  annoDb = "org.Hs.eg.db"
+)
+
+peakAnno = as.data.frame(peakAnno)
+counts_df = cbind(counts_df, peakAnno)
+counts_df$peaks = rownames(counts_df)
+
+# genes to plot
+genes_of_interest = list(
+  list('KLK3', c('Prostate')),
+  list('CHGA', c('NEPC', 'SCLC', 'Merkel cell', 'Small cell bladder')),
+  list('CDX2', c('Colorectal', 'Esophageal')),
+  list('S100A1', c('Melanoma')),
+  list('ALB', c('Hepatocellular')),
+  list('ESR1', c('Breast cancer (ER+)')),
+  list('TP63', c('Lung (squamous)')),
+  list('CD5', c('Thymic')),
+  list('AR', c('Prostate')),
+  list('KRT20', c('Colorectal', 'Merkel cell')),
+  list('DLL3', c('Melanoma', 'Merkel cell', 'NEPC', 'SCLC')),
+  list('ERBB3', c('All cancers')),
+  list('NECTIN4', c('All cancers')),
+  list('GAPDH', c('All cancers')),
+  list('ERBB2', c('HER2+'))
+)
+
+# subset the counts df to include genes of interest and tissue specific genes
+keep_these_genes = genes_of_interest %>% unlist() %>% setdiff(c(meta$cancer_type, meta$cancer_subtype))
+counts_sub = subset(counts_df, SYMBOL %in% keep_these_genes)
+
+toplot = pivot_longer(counts_sub,
+                      setdiff(colnames(counts_sub),
+                              c(colnames(peakAnno), 'peaks')),
+                      values_to = 'signal')
+
+meta_ix = match(toplot$name, meta$study_name)
+toplot$cancer_type = meta$cancer_type[meta_ix]
+toplot$cancer_subtype = meta$cancer_subtype[meta_ix]
+toplot$ctDNA = meta$ctDNA[meta_ix]
+toplot$ctDNA_estimate = meta$ctDNA_estimate[meta_ix]
+toplot$enrichment = meta$enrichment[meta_ix]
+toplot$fragments = meta$fragments[meta_ix]
+toplot$HER2 = meta$HER2[meta_ix]
+
+
+toplot = subset(toplot, ctDNA_estimate > 0.05 |
+                    cancer_type == 'Healthy')
+
+
+# subset by QC meaures
+toplot = subset(toplot, (enrichment * fragments > 4e7) & enrichment > 10) 
+
+# get median signal for each peak in each cancer type
+type_median = toplot %>% group_by(SYMBOL, cancer_type, peaks) %>% summarize(med_signal = median(signal))
+toplot = merge(toplot, type_median)
+
+dir.create('out/classification/frag_counts/sites')
+
+# plots
+for (gene_list in genes_of_interest) {
+  gene = gene_list[[1]]
+  target_cancers = gene_list[[2]]
+  toplot_sub = subset(toplot, SYMBOL == gene)
+  
+  #include a special case for ERBB2, where it doesn't segregate by cancer type, but rather annotated HER2 status
+  if (gene  == 'ERBB2') {
+    toplot_sub = subset(toplot_sub,!is.na(HER2))
+    #rename columns to make compatible with the general case below
+    toplot_sub$histology = toplot_sub$cancer_type
+    toplot_sub$cancer_type = toplot_sub$HER2
+
+  } else if (gene %in% c('ERBB3', 'NECTIN4', 'GAPDH')) {
+    toplot_sub$cancer_type[toplot_sub$cancer_type == 'Healthy'] = 'Healthy'
+    toplot_sub$cancer_type[toplot_sub$cancer_type != 'Healthy'] = 'All cancers'
+  }
+  
+  toplot_sub$on_target = toplot_sub$cancer_type %in% target_cancers
+  
+  if (TRUE) { # only keep peaks near TSS
+    toplot_sub = subset(toplot_sub, abs(distanceToTSS) < 1000)
+  }
+  
+  #keep just the H3K4me3 peak that is most differential
+  tmp = toplot_sub %>% group_by(on_target, peaks) %>% summarize(signal = mean(signal))  
+  ix = which.max((tmp$signal[tmp$on_target] - tmp$signal[!tmp$on_target]) /
+                   tmp$signal[tmp$on_target])
+  
+  best_peak = tmp$peaks[ix]
+  toplot_sub = subset(toplot_sub, peaks == best_peak)
+  
+  stopifnot(length(unique(toplot_sub$peaks)) == 1)
+  
+  # calculate significance
+  tmp = wilcox.test(x = toplot_sub$signal[toplot_sub$on_target], y = toplot_sub$signal[!toplot_sub$on_target])
+  
+  # rank groups by signal
+  cancer_rank = unique(toplot_sub$cancer_type[order(toplot_sub$med_signal, decreasing = TRUE)])
+  
+  cols = c('TRUE' = 'darkorange', 'FALSE' = 'darkgray')
+  toplot_sub$cancer_type = factor(toplot_sub$cancer_type, levels = cancer_rank)
+  
+
+  if (nrow(toplot_sub) == 0)
+    next
+  if (gene == 'ERBB2') {
+    p = ggplot(toplot_sub, aes(
+      y = log(signal + 1, 2),
+#      fill = on_target
+      col = on_target,
+      x = histology      
+    ))    
+  } else if (gene %in% c('NECTIN4', 'GAPDH', 'ERBB3')) {
+    p = ggplot(toplot_sub, aes(
+      y = log(signal + 1, 2),
+      x = cancer_type,
+      col = on_target
+    ))
+  } else {
+    p = ggplot(toplot_sub, aes(y = signal, x = cancer_type, col = on_target))
+  }
+  
+  p = p + geom_boxplot(width = 0.8, outlier.shape = NA) +
+    geom_point(position = position_jitterdodge()) + 
+    theme_classic() +
+    ggtitle(paste0(
+      'cfChIP signal at ',
+      gene,
+      ' by cancer type\n p = ',
+      signif(tmp$p.value, 3)
+    )) +
+    theme(axis.text.x = element_text(
+      angle = 90,
+      vjust = 1,
+      hjust = 1
+    )) +
+    scale_color_manual(values = cols)
+  print(p)
+  
+  # save tsv file with signal
+  out_file = paste0('out/classification/frag_counts/sites/',
+                    gene,
+                    '_signal.tsv')
+  write.table(
+    toplot_sub,
+    file = out_file,
+    quote = FALSE,
+    sep = '\t',
+    row.names = FALSE,
+    col.names = TRUE
+  )
+  
+}
+  
+```
+plot PSA vs epigenetic siganl for prostate cancer
+```{r plot_PSA}
+# load metadata with PSA measurements:
+meta_file = 'data/metadata/PSA_annotations.xlsx'
+psa = read_xlsx(meta_file)
+psa$PSA = as.numeric(psa$PSA)
+
+# select the relevant H3K4me3 measurements:
+toplot_sub = subset(toplot, SYMBOL == 'KLK3' & 
+                      distanceToTSS == 0 &
+                      cancer_type %in% c('Prostate', 'NEPC') &
+                      enrichment > 10 & 
+                      enrichment * fragments > 4e7)
+
+toplot_sub$study_name = toplot_sub$name
+toplot_sub = merge(toplot_sub, psa, by = 'study_name')
+
+# keep only one individual for each
+toplot_sub = toplot_sub %>% group_by(individual_id) %>% slice_max(order_by = fragments, n = 1)
+
+# test correlation
+tmp = cor.test(toplot_sub$PSA, toplot_sub$signal, method = 'pearson')
+
+
+ggplot(toplot_sub, aes(y=PSA, x=signal)) +
+  geom_point(aes(size = ctDNA_estimate), alpha = 0.5) +
+  theme_classic() + 
+  geom_smooth(method = 'lm', se = FALSE) +
+  ggtitle(paste0('PSA vs cf H3K4me3\n corr = ', signif(tmp$estimate, 2), '\n p = ', signif(tmp$p.value,2)))
+
+# test correlation
+tmp = cor.test(toplot_sub$PSA, toplot_sub$ctDNA_estimate, method = 'pearson')
+
+ggplot(toplot_sub, aes(y=PSA, x=ctDNA_estimate)) +
+  geom_point() +
+  theme_classic() + 
+  ggtitle(paste0('PSA vs ctDNA\n corr = ', signif(tmp$estimate, 2), '\n p = ', signif(tmp$p.value,2)))
+    
+# test correlation
+tmp = cor.test(toplot_sub$signal, toplot_sub$ctDNA_estimate, method = 'pearson')
+
+ggplot(toplot_sub, aes(y=signal, x=ctDNA_estimate)) +
+  geom_point() +
+  theme_classic() + 
+  ggtitle(paste0('H3K4me3 vs ctDNA\n corr = ', signif(tmp$estimate, 2), '\n p = ', signif(tmp$p.value,2)))
+
+
+```
