@@ -1390,11 +1390,16 @@ meta = read.table(
 meta = subset(meta, antibody == 'H3K4me3')
 
 # adjust the cancer_type annotation to capture the subtypes we want to compare
-meta$cancer_type[meta$cancer_subtype == 'ER+'] = 'Breast cancer (ER+)'
-meta$cancer_type[meta$cancer_subtype == 'Triple-negative'] = 'Breast cancer (ER-)'
+meta$cancer_type[grepl('ER+', meta$cancer_subtype)] = 'Breast (ER+)'
+meta$cancer_type[grepl('ER-', meta$cancer_subtype)] = 'Breast (ER-)'
+
+#meta$cancer_type[meta$cancer_type == 'NSCLC' &
+#                   meta$cancer_subtype == 'Adenocarinoma'] = 'Lung (adenocarcinoma)'
+#meta$cancer_type[meta$cancer_type == 'NSCLC' &
+#                   meta$cancer_subtype == 'Squamous'] = 'Lung (squamous)'
 
 meta$cancer_type[meta$cancer_type == 'NSCLC' &
-                   meta$cancer_subtype == 'Adenocarinoma'] = 'Lung (adenocarcinoma)'
+                   meta$cancer_subtype == 'Adenocarcinoma'] = 'Lung (adenocarcinoma)'
 meta$cancer_type[meta$cancer_type == 'NSCLC' &
                    meta$cancer_subtype == 'Squamous'] = 'Lung (squamous)'
 
@@ -1507,7 +1512,7 @@ genes_of_interest = list(
   list('CDX2', c('Colorectal', 'Esophageal')),
   list('S100A1', c('Melanoma')),
   list('ALB', c('Hepatocellular')),
-  list('ESR1', c('Breast cancer (ER+)')),
+  list('ESR1', c('Breast (ER+)')),
   list('TP63', c('Lung (squamous)')),
   list('CD5', c('Thymic')),
   list('AR', c('Prostate')),
@@ -1536,7 +1541,7 @@ toplot$ctDNA_estimate = meta$ctDNA_estimate[meta_ix]
 toplot$enrichment = meta$enrichment[meta_ix]
 toplot$fragments = meta$fragments[meta_ix]
 toplot$HER2 = meta$HER2[meta_ix]
-
+toplot$individual_id = meta$individual_id[meta_ix]
 
 toplot = subset(toplot, ctDNA_estimate > 0.05 |
                     cancer_type == 'Healthy')
@@ -1556,6 +1561,10 @@ for (gene_list in genes_of_interest) {
   gene = gene_list[[1]]
   target_cancers = gene_list[[2]]
   toplot_sub = subset(toplot, SYMBOL == gene)
+  
+  
+#  # if an individual has multiple samples, keep the sample with the most fragments:
+  toplot_sub = toplot_sub %>% group_by(individual_id) %>% slice_max(order_by = fragments, n = 1)
   
   #include a special case for ERBB2, where it doesn't segregate by cancer type, but rather annotated HER2 status
   if (gene  == 'ERBB2') {
@@ -1621,7 +1630,7 @@ for (gene_list in genes_of_interest) {
       'cfChIP signal at ',
       gene,
       ' by cancer type\n p = ',
-      signif(tmp$p.value, 3)
+      signif(tmp$p.value, 3), '\nN=', nrow(toplot_sub)
     )) +
     theme(axis.text.x = element_text(
       angle = 90,
@@ -1643,7 +1652,8 @@ for (gene_list in genes_of_interest) {
     row.names = FALSE,
     col.names = TRUE
   )
-  
+  #tmp
+#    if (gene  == 'DLL3') stop() #tmp
 }
   
 ```
